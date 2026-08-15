@@ -16,6 +16,7 @@ import os
 import sys
 import asyncio
 import contextlib
+import hashlib
 from collections import deque
 import json
 import signal
@@ -24,6 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import time
 import uuid
+import httpx
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 from utils.runtime_paths import ENV_FILE, USER_FILES_DIR
@@ -32,6 +34,7 @@ from webot.permission_context import create_or_reuse_permission_request
 from webot.runtime_store import find_active_approval_for_action, get_tool_approval
 from webot.workspace import resolve_session_workspace
 from utils.bash_safety import analyze_command, RiskLevel
+from utils.bg_notify import register_pending_notify
 
 mcp = FastMCP("Commander")
 
@@ -174,6 +177,7 @@ class BackgroundJob:
     pid: int | None = None
     task: asyncio.Task | None = None
     proc: asyncio.subprocess.Process | None = None
+    notify_on_done: bool = False   # opt-in：任务完成时唤醒发起的 agent 会话（system_trigger）
 
 
 def _jobs_dir(workspace: str) -> Path:
@@ -204,6 +208,7 @@ def _persist_job(job: BackgroundJob) -> None:
         "error": job.error,
         "session_id": job.session_id,
         "pid": job.pid,
+        "notify_on_done": job.notify_on_done,
     }
     _job_meta_path(job.workspace, job.job_id).write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
@@ -236,11 +241,21 @@ def _load_job_from_workspace(workspace: str, job_id: str) -> BackgroundJob | Non
         error=str(payload.get("error") or ""),
         session_id=str(payload.get("session_id") or ""),
         pid=int(payload["pid"]) if payload.get("pid") is not None else None,
+        notify_on_done=bool(payload.get("notify_on_done") or False),
     )
 
 
 def _reap_detached_runners() -> None:
     _DETACHED_RUNNERS[:] = [proc for proc in _DETACHED_RUNNERS if proc.poll() is None]
+
+
+# ── 后台任务完成主动推送（opt-in：notify_on_done=True 时才生效）──────────────
+# NOTE: 通知由长驻的主进程（mainagent）驱动，不在 commander 进程内 watch。
+# commander 是 per-tool-call 的短命 stdio 子进程，工具一返回进程就被销毁，进程内
+# 的 asyncio watcher 会随之死掉、永不发通知；而 detached runner 处于沙箱、没有
+# INTERNAL_TOKEN，也无法自己补发。所以这里只「登记」一个待通知指针（见
+# utils.bg_notify.register_pending_notify），由 mainagent 的 background_notify_loop
+# 轮询、在任务达终态时调用 /system_trigger 唤醒发起会话。
 
 
 def _pid_is_running(pid: int | None) -> bool:
@@ -305,18 +320,14 @@ def _resolve_background_job(job_id: str, username: str = "", session_id: str = "
     return _refresh_background_job(job)
 
 
-def _write_runner_script(jobs_dir: Path) -> Path:
-    script_path = jobs_dir / "runner.py"
-    if script_path.exists():
-        return script_path
-    script_path.write_text(
-        """#!/usr/bin/env python3
+_RUNNER_SCRIPT = """#!/usr/bin/env python3
 import json
 import os
 import signal
 import subprocess
 import sys
 import time
+import urllib.request
 
 
 def _write_meta(meta_path, updates):
@@ -328,6 +339,22 @@ def _write_meta(meta_path, updates):
     payload.update(updates)
     with open(meta_path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
+
+
+def _notify_done(cfg):
+    # Event push: tell the long-lived main process this job finished so it can
+    # wake the originating session. Carries only the job id (no token); the main
+    # process resolves the session from its own trusted pointer. Best-effort.
+    url = cfg.get("notify_url")
+    job_id = cfg.get("job_id")
+    if not url or not job_id:
+        return
+    try:
+        data = json.dumps({"job_id": job_id}).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=5).close()
+    except Exception:
+        pass
 
 
 def main():
@@ -387,13 +414,24 @@ def main():
                 "error": str(exc),
             },
         )
+    # Terminal meta is written on every path above — push the completion event.
+    _notify_done(cfg)
 
 
 if __name__ == "__main__":
     main()
-""",
-        encoding="utf-8",
-    )
+"""
+
+
+def _write_runner_script(jobs_dir: Path) -> Path:
+    # Version the cached script by content hash so template changes auto-invalidate
+    # it. A fixed "runner.py" name would be reused forever and silently run stale
+    # logic (e.g. miss the completion push), since the old write was skipped
+    # whenever the file already existed.
+    digest = hashlib.sha1(_RUNNER_SCRIPT.encode("utf-8")).hexdigest()[:10]
+    script_path = jobs_dir / f"runner_{digest}.py"
+    if not script_path.exists():
+        script_path.write_text(_RUNNER_SCRIPT, encoding="utf-8")
     return script_path
 
 
@@ -408,7 +446,13 @@ def _launch_detached_background_job(job: BackgroundJob, env: dict[str, str]) -> 
         "stderr_path": job.stderr_path,
         "meta_path": str(_job_meta_path(job.workspace, job.job_id)),
         "timeout_seconds": job.timeout_seconds,
+        "job_id": job.job_id,
     }
+    if job.notify_on_done and job.session_id:
+        # Loopback push target; main process resolves the session from its
+        # trusted pointer, so the sandboxed runner needs no token.
+        port_agent = os.getenv("PORT_AGENT", "51200")
+        payload["notify_url"] = f"http://127.0.0.1:{port_agent}/internal/bg_job_done"
     kwargs = {
         "cwd": job.workspace,
         "env": env,
@@ -974,9 +1018,14 @@ async def start_background_command(
     session_id: str = "",
     cwd: str = "",
     timeout_seconds: int = 0,
+    notify_on_done: bool = False,
 ) -> str:
     """
     启动一个后台命令任务，立即返回 job_id，适合长时间运行的命令。
+
+    :param notify_on_done: 默认 False（任务完成后静默）。设为 True 时，命令跑完会
+        自动用一条系统消息唤醒发起它的本会话，把状态和输出尾部推回给你——你无需
+        轮询，跑完会主动来叫你。适合分钟级长任务（如建造、批处理）。
     """
     # 白名单校验
     reject_reason = _validate_command(command)
@@ -1015,12 +1064,17 @@ async def start_background_command(
         stderr_path=str(jobs_dir / f"{job_id}.stderr.log"),
         timeout_seconds=timeout_value,
         session_id=session_id,
+        notify_on_done=bool(notify_on_done),
     )
     Path(job.stdout_path).write_text("", encoding="utf-8")
     Path(job.stderr_path).write_text("", encoding="utf-8")
     _persist_job(job)
     _launch_detached_background_job(job, _sandbox_env(workspace, username))
     _BACKGROUND_JOBS[job_id] = job
+    if job.notify_on_done and job.session_id:
+        # 登记待通知指针；由长驻的 mainagent.background_notify_loop 在任务达终态时
+        # 调 /system_trigger 唤醒发起会话（commander 进程用完即销毁，不能自己 watch）。
+        register_pending_notify(job_id, str(_job_meta_path(job.workspace, job_id)))
     result = "✅ 后台任务已启动\n" + _job_summary(job)
     if approval_note:
         result = approval_note + "\n\n" + result

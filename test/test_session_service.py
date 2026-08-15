@@ -38,7 +38,29 @@ if "aiosqlite" not in sys.modules:
     aiosqlite_stub.connect = connect
     sys.modules["aiosqlite"] = aiosqlite_stub
 
-from api.session_models import DeleteSessionRequest, SessionListRequest
+if "pydantic" not in sys.modules:
+    pydantic_stub = types.ModuleType("pydantic")
+
+    class BaseModel:
+        def __init__(self, **data):
+            for key, value in data.items():
+                setattr(self, key, value)
+
+    pydantic_stub.BaseModel = BaseModel
+    sys.modules["pydantic"] = pydantic_stub
+
+if "utils.logging_utils" not in sys.modules:
+    logging_utils_stub = types.ModuleType("utils.logging_utils")
+
+    def get_logger(_name):
+        import logging
+
+        return logging.getLogger(_name)
+
+    logging_utils_stub.get_logger = get_logger
+    sys.modules["utils.logging_utils"] = logging_utils_stub
+
+from api.session_models import DeleteSessionRequest, SessionListRequest, SessionStatusRequest
 from api.session_service import SessionService
 
 
@@ -75,6 +97,34 @@ class _FakeAgent:
 
     def list_active_task_keys(self, prefix: str):
         return [thread_id for thread_id in self._statuses if thread_id.startswith(prefix)]
+
+    def has_pending_system_messages(self, thread_id: str) -> bool:
+        return bool(self._statuses.get(thread_id, {}).get("pending_system", 0))
+
+    def consume_pending_system_messages(self, thread_id: str) -> int:
+        return int(self._statuses.get(thread_id, {}).get("pending_system", 0))
+
+    def is_thread_busy(self, thread_id: str) -> bool:
+        return bool(self._statuses.get(thread_id, {}).get("busy", False))
+
+    def get_thread_busy_source(self, thread_id: str) -> str:
+        return str(self._statuses.get(thread_id, {}).get("source", ""))
+
+    def get_thread_context_usage(self, thread_id: str) -> dict:
+        return self._statuses.get(thread_id, {}).get(
+            "context_usage",
+            {"tokens": 0, "budget": 0, "percent": 0, "remaining": 0},
+        )
+
+    def set_thread_context_usage(self, thread_id: str, tokens: int, budget: int) -> None:
+        usage = self._statuses.setdefault(thread_id, {})
+        percent = min(100, round(tokens / budget * 100)) if budget > 0 else 0
+        usage["context_usage"] = {
+            "tokens": tokens,
+            "budget": budget,
+            "percent": percent,
+            "remaining": max(0, budget - tokens),
+        }
 
 
 class SessionServiceTests(unittest.IsolatedAsyncioTestCase):
@@ -121,6 +171,39 @@ class SessionServiceTests(unittest.IsolatedAsyncioTestCase):
             result["sessions"],
             [{"session_id": "default", "busy": False, "source": "", "pending_system": 0}],
         )
+
+    async def test_session_status_includes_context_usage(self):
+        service = SessionService(
+            db_path=":memory:",
+            agent=_FakeAgent(
+                {},
+                statuses={
+                    "alice#default": {
+                        "busy": True,
+                        "source": "user",
+                        "pending_system": 2,
+                        "context_usage": {
+                            "tokens": 64000,
+                            "budget": 64000,
+                            "percent": 100,
+                            "remaining": 0,
+                        },
+                    }
+                },
+            ),
+            verify_auth_or_token=lambda user_id, password, token: None,
+            extract_text=lambda content: content if isinstance(content, str) else str(content),
+        )
+
+        result = await service.session_status(
+            SessionStatusRequest(user_id="alice", session_id="default"), None
+        )
+
+        self.assertEqual(result["busy"], True)
+        self.assertEqual(result["context_percent"], 100)
+        self.assertEqual(result["context_remaining"], 0)
+        self.assertEqual(result["context_tokens"], 64000)
+        self.assertEqual(result["context_budget"], 64000)
 
     async def test_delete_subagent_session_also_cleans_registry_row(self):
         service = SessionService(

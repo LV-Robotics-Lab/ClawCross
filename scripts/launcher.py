@@ -101,6 +101,32 @@ venv_python = sys.executable
 # 子进程列表（用于管理所有启动的服务）
 child_procs = []
 cleanup_done = False
+CHILD_PID_FILES = []
+
+
+def _service_pid_path(name):
+    safe = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in name)
+    return os.path.join(str(PID_DIR), f"{safe}.pid")
+
+
+def _track_child_pid(proc, name):
+    path = _service_pid_path(name)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(str(proc.pid))
+    except OSError:
+        return
+    proc._cc_pid_file = path
+    CHILD_PID_FILES.append(path)
+
+
+def _remove_child_pid_files():
+    for path in list(dict.fromkeys(CHILD_PID_FILES)):
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+        except OSError:
+            pass
 
 
 def _init_env_placeholder(key: str):
@@ -185,6 +211,8 @@ def cleanup():
             proc.wait(timeout=2)
         except Exception:
             pass
+
+    _remove_child_pid_files()
 
     print("✅ 所有服务已关闭")
 
@@ -395,6 +423,7 @@ def start_service(service):
     )
     child_procs.append(proc)
     service["proc"] = proc
+    _track_child_pid(proc, service.get("pid_name") or service["label"])
     return proc
 
 
@@ -447,12 +476,32 @@ def start_chatbot_if_configured(platforms):
     proc._cc_optional = True
     proc._cc_chatbot = True
     child_procs.append(proc)
+    _track_child_pid(proc, "chatbot")
     print(f"   ✅ 社交媒体机器人已启动 (PID: {proc.pid})")
     return proc
 
 
 def start_harness_conductor_if_configured():
-    enabled = (os.getenv("CLAWCROSS_HARNESS_CONDUCTOR") or "1").strip().lower()
+    # harness 配置（CLAWCROSS_HARNESS_CONDUCTOR 开关 / DASHBOARD_URL / INTERNAL_TOKEN /
+    # REMOTE_HOST / DEFAULT_PROJECT_ID 等）住在独立的 harness.env 里，launcher 只 load 了
+    # config/.env，因此这些键既到不了下面的开关判断，也到不了 conductor 子进程。这里先把
+    # harness.env 合并进一份子进程环境，只填补当前环境里缺失/为空的键（不覆盖已显式设置的值），
+    # 然后用合并后的值判断开关并交给 conductor。
+    conductor_env = set_subprocess_env(os.environ)
+    harness_env_path = os.path.expanduser(
+        os.getenv("CLAWCROSS_HARNESS_ENV")
+        or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(ENV_FILE_PATH))), "harness.env")
+    )
+    if os.path.isfile(harness_env_path):
+        try:
+            from dotenv import dotenv_values
+            for key, value in dotenv_values(harness_env_path).items():
+                if value and not (conductor_env.get(key) or "").strip():
+                    conductor_env[key] = value
+        except Exception as exc:
+            print(f"   ⚠️ 读取 harness.env 失败，conductor 可能缺少 dashboard 配置: {exc}")
+
+    enabled = (conductor_env.get("CLAWCROSS_HARNESS_CONDUCTOR") or "1").strip().lower()
     if enabled in ("0", "false", "no", "off"):
         print("🧭 [skip] ClawCross harness 主控已禁用（CLAWCROSS_HARNESS_CONDUCTOR=0）")
         return None
@@ -463,13 +512,14 @@ def start_harness_conductor_if_configured():
     proc = subprocess.Popen(
         [venv_python, script],
         cwd=WORKING_DIR,
-        env=set_subprocess_env(os.environ),
+        env=conductor_env,
         stdin=subprocess.DEVNULL,
         stdout=None,
         stderr=None,
     )
     proc._cc_optional = True
     child_procs.append(proc)
+    _track_child_pid(proc, "harness_conductor")
     print(f"   ✅ Harness 主控已启动 (PID: {proc.pid})")
     return proc
 
@@ -576,23 +626,26 @@ services = [
         "label": "定时调度中心",
         "script": "src/utils/scheduler_service.py",
         "port": PORT_SCHEDULER,
-        "timeout": 15.0,
+        "timeout": 60.0,
+        "pid_name": "scheduler_service",
     },
     {
         "message": f"🏛️ [2/5] 启动 OASIS 论坛服务 (port {PORT_OASIS})...",
         "label": "OASIS 论坛服务",
         "script": "oasis/server.py",
         "port": PORT_OASIS,
-        "timeout": 45.0,
+        "timeout": 90.0,
         "health_url": f"http://127.0.0.1:{PORT_OASIS}/experts",
+        "pid_name": "oasis_server",
     },
     {
         "message": f"🤖 [3/5] 启动 AI Agent (port {PORT_AGENT})...",
         "label": "AI Agent",
         "script": "src/mainagent.py",
         "port": PORT_AGENT,
-        "timeout": 25.0,
+        "timeout": 120.0,
         "health_url": f"http://127.0.0.1:{PORT_AGENT}/v1/models",
+        "pid_name": "mainagent",
     },
 ]
 
@@ -854,7 +907,8 @@ if should_start_chatbot:
             "label": "前端 Web UI",
             "script": "src/front.py",
             "port": PORT_FRONTEND,
-            "timeout": 20.0,
+            "timeout": 90.0,
+            "pid_name": "front",
         }
     )
 else:
@@ -868,7 +922,8 @@ else:
             "label": "前端 Web UI",
             "script": "src/front.py",
             "port": PORT_FRONTEND,
-            "timeout": 20.0,
+            "timeout": 90.0,
+            "pid_name": "front",
         }
     )
 

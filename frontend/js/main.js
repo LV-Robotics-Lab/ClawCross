@@ -75,6 +75,7 @@ const i18n = {
         local_login_banner_title: '已使用本机免密登录',
         local_login_banner_body: '当前用户名「{user_id}」还没有密码。如需后续密码登录或远程访问，可在 Settings 里设置密码并保存为用户。',
         local_login_banner_action: '去设置',
+        context_usage: '上下文已用 {percent}%',
         llm_not_configured: 'LLM API 未配置，请先前往设置填写 API Key',
         project_update_banner: '发现新版本 {latest}，点击查看并更新',
         project_update_banner_dirty: '发现新版本 {latest}，但本地有未提交改动',
@@ -877,6 +878,7 @@ orch_openclaw_sessions: '🦞 OpenClaw',
         local_login_banner_title: 'Local no-password login active',
         local_login_banner_body: 'The current username "{user_id}" does not have a password yet. Open Settings to save one for future password or remote login.',
         local_login_banner_action: 'Open Settings',
+        context_usage: 'Context {percent}% used',
         llm_not_configured: 'LLM API not configured. Click here to set up API Key.',
         project_update_banner: 'New version {latest} is available. Click to review and update.',
         project_update_banner_dirty: 'New version {latest} is available, but local changes block auto update.',
@@ -2118,6 +2120,146 @@ function updateSessionDisplay() {
         el.textContent = '#' + currentSessionId.slice(-6);
         el.title = t('session_id') + ': ' + currentSessionId;
     }
+}
+
+let sessionContextUsageState = {
+    percent: 0,
+    remaining: 0,
+    tokens: 0,
+    budget: 0,
+};
+
+function formatContextTokenCount(value) {
+    const n = Number(value);
+    if (!Number.isFinite(n) || n <= 0) return '0';
+    return Math.round(n).toLocaleString();
+}
+
+function getContextPercentValue(percent, tokens, budget) {
+    const tokenValue = Number(tokens);
+    const budgetValue = Number(budget);
+    if (Number.isFinite(tokenValue) && Number.isFinite(budgetValue) && budgetValue > 0) {
+        return Math.max(0, Math.min(100, (tokenValue / budgetValue) * 100));
+    }
+    const percentValue = Number(percent);
+    return Number.isFinite(percentValue) ? Math.max(0, Math.min(100, percentValue)) : 0;
+}
+
+function formatContextBadgePercent(percentValue) {
+    if (!Number.isFinite(percentValue) || percentValue <= 0) return '0';
+    if (percentValue < 1) return '<1';
+    return String(Math.round(percentValue));
+}
+
+function formatContextDetailPercent(percentValue) {
+    if (!Number.isFinite(percentValue) || percentValue <= 0) return '0';
+    if (percentValue < 0.01) return '<0.01';
+    if (percentValue < 1) return percentValue.toFixed(2);
+    if (percentValue < 10) return percentValue.toFixed(1);
+    return String(Math.round(percentValue));
+}
+
+function renderSessionContextDetail() {
+    const detail = document.getElementById('session-context-detail');
+    if (!detail) return;
+
+    const state = sessionContextUsageState || {};
+    const percentValue = getContextPercentValue(state.percent, state.tokens, state.budget);
+    const usedLabel = currentLang === 'zh-CN' ? '已使用' : 'Used';
+    const totalLabel = currentLang === 'zh-CN' ? '总量' : 'Total';
+    const remainingLabel = currentLang === 'zh-CN' ? '剩余' : 'Remaining';
+    const percentLabel = currentLang === 'zh-CN' ? '占比' : 'Percent';
+
+    detail.innerHTML = `
+        <div class="oc-context-usage-detail-row">
+            <span>${percentLabel}</span>
+            <strong>${formatContextDetailPercent(percentValue)}%</strong>
+        </div>
+        <div class="oc-context-usage-detail-row">
+            <span>${usedLabel}</span>
+            <strong>${formatContextTokenCount(state.tokens)} tokens</strong>
+        </div>
+        <div class="oc-context-usage-detail-row">
+            <span>${totalLabel}</span>
+            <strong>${formatContextTokenCount(state.budget)} tokens</strong>
+        </div>
+        <div class="oc-context-usage-detail-row">
+            <span>${remainingLabel}</span>
+            <strong>${formatContextTokenCount(state.remaining)} tokens</strong>
+        </div>
+    `;
+}
+
+function toggleSessionContextDetail(event) {
+    if (event) event.stopPropagation();
+    const detail = document.getElementById('session-context-detail');
+    if (!detail) return;
+    renderSessionContextDetail();
+    const nextHidden = !detail.hidden;
+    detail.hidden = nextHidden;
+    const badge = document.getElementById('session-context-usage');
+    if (badge) badge.setAttribute('aria-expanded', String(!nextHidden));
+}
+
+function handleSessionContextDetailKeydown(event) {
+    if (!event) return;
+    if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        toggleSessionContextDetail(event);
+    }
+}
+
+function closeSessionContextDetail() {
+    const detail = document.getElementById('session-context-detail');
+    if (detail) detail.hidden = true;
+    const badge = document.getElementById('session-context-usage');
+    if (badge) badge.setAttribute('aria-expanded', 'false');
+}
+
+function updateSessionContextUsageBadge(percent, remaining, tokens, budget) {
+    const badge = document.getElementById('session-context-usage');
+    if (!badge) return;
+    const remainingValue = Number(remaining);
+    const tokenValue = Number(tokens);
+    const budgetValue = Number(budget);
+    const percentValue = getContextPercentValue(percent, tokenValue, budgetValue);
+    const validPercent = Number.isFinite(percentValue) ? Math.max(0, Math.min(100, percentValue)) : null;
+    const validRemaining = Number.isFinite(remainingValue) ? Math.max(0, Math.round(remainingValue)) : null;
+    const validTokens = Number.isFinite(tokenValue) ? Math.max(0, Math.round(tokenValue)) : 0;
+    const validBudget = Number.isFinite(budgetValue) ? Math.max(0, Math.round(budgetValue)) : 0;
+
+    sessionContextUsageState = {
+        percent: validPercent || 0,
+        remaining: validRemaining || 0,
+        tokens: validTokens,
+        budget: validBudget,
+    };
+    renderSessionContextDetail();
+
+    if (validPercent === null || !currentSessionId) {
+        badge.style.display = 'inline-flex';
+        badge.textContent = t('context_usage').replace('{percent}', '0');
+        badge.title = currentLang === 'zh-CN'
+            ? '当前会话上下文已使用 0%'
+            : 'Current session context is 0% used';
+        badge.classList.remove('warn', 'critical');
+        return;
+    }
+
+    const remainingText = validRemaining === null
+        ? ''
+        : (currentLang === 'zh-CN'
+            ? `，剩余约 ${validRemaining.toLocaleString()} tokens`
+            : `. About ${validRemaining.toLocaleString()} tokens remaining`);
+    const badgePercent = formatContextBadgePercent(validPercent);
+    const detailPercent = formatContextDetailPercent(validPercent);
+    badge.textContent = t('context_usage').replace('{percent}', badgePercent);
+    badge.title = (currentLang === 'zh-CN'
+        ? `当前会话上下文已使用 ${detailPercent}%${remainingText}；点击查看已用和总量`
+        : `Current session context is ${detailPercent}% used${remainingText}. Click for used and total tokens`);
+    badge.style.display = 'inline-flex';
+    badge.classList.toggle('warn', validPercent >= 80 && validPercent < 95);
+    badge.classList.toggle('critical', validPercent >= 95);
 }
 
 // ===== Agent Meta Modal Logic =====
@@ -4337,20 +4479,7 @@ async function switchToSession(sessionId, force = false, options = {}) {
             _acpLastTranscriptKey = acpComputeTranscriptKey();
             await acpPaintTranscript();
         }
-        try {
-            const sr = await fetch('/proxy_session_status', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ session_id: sessionId }),
-            });
-            const sd = await sr.json();
-            if (sd.busy) setSystemBusyUI(true);
-            else setSystemBusyUI(false);
-        } catch (e) {
-            /* ignore */
-        } finally {
-            if (!quiet) hidePageLoading();
-        }
+        if (!quiet) hidePageLoading();
         return;
     }
 
@@ -4359,7 +4488,6 @@ async function switchToSession(sessionId, force = false, options = {}) {
     if (!quiet) {
         chatBox.innerHTML = `<div class="text-xs text-gray-400 text-center py-4">${t('history_loading_msg')}</div>`;
     }
-
     try {
         const resp = await fetch('/proxy_session_history', {
             method: 'POST',
@@ -4368,6 +4496,12 @@ async function switchToSession(sessionId, force = false, options = {}) {
         });
         const data = await resp.json();
         chatBox.innerHTML = '';
+        updateSessionContextUsageBadge(
+            data.context_percent,
+            data.context_remaining,
+            data.context_tokens,
+            data.context_budget
+        );
 
         if (!data.messages || data.messages.length === 0) {
             renderWeBotWelcomeMessage();
@@ -4375,6 +4509,7 @@ async function switchToSession(sessionId, force = false, options = {}) {
             return;
         }
 
+        const parts = [];
         for (const msg of data.messages) {
             if (msg.role === 'user') {
                 // 支持多模态历史消息（content 可能是 string 或 array）
@@ -4390,30 +4525,31 @@ async function switchToSession(sessionId, force = false, options = {}) {
                         }
                     }
                 }
-                chatBox.innerHTML += `
+                parts.push(`
                     <div class="flex justify-end">
                         <div class="message-user bg-blue-600 text-white p-4 max-w-[85%] shadow-sm">
                             ${imagesHtml}${imagesHtml ? '<div style="margin-top:6px">' : ''}${escapeHtml(textContent || '('+t('image_placeholder')+')')}${imagesHtml ? '</div>' : ''}
                         </div>
-                    </div>`;
+                    </div>`);
             } else if (msg.role === 'tool') {
-                chatBox.innerHTML += `
+                parts.push(`
                     <div class="flex justify-start">
                         <div class="bg-gray-100 border border-dashed border-gray-300 p-3 max-w-[85%] shadow-sm text-xs text-gray-500 rounded-lg">
                             <div class="font-semibold text-gray-600 mb-1">🔧 ${t('tool_return')}: ${escapeHtml(msg.tool_name || '')}</div>
                             ${renderToolPager(msg.content, { title: t('tool_full_output') })}
                         </div>
-                    </div>`;
+                    </div>`);
             } else {
                 const toolCallsHtml = renderToolCallDetails(msg.tool_calls);
-                chatBox.innerHTML += `
+                parts.push(`
                     <div class="flex justify-start">
                         <div class="message-agent bg-white border p-4 max-w-[85%] shadow-sm text-gray-700 markdown-body tc-markdown" data-tts-ready="1">
                             ${toolCallsHtml}${msg.content ? renderMarkdown(msg.content) : '<span class="text-gray-400 text-xs">('+t('tool_calling')+')</span>'}
                         </div>
-                    </div>`;
+                    </div>`);
             }
         }
+        chatBox.innerHTML = parts.join('');
         // 为历史 AI 消息添加朗读按钮
         chatBox.querySelectorAll('[data-tts-ready="1"]').forEach(div => {
             div.removeAttribute('data-tts-ready');
@@ -4428,27 +4564,12 @@ async function switchToSession(sessionId, force = false, options = {}) {
             <div class="text-xs text-red-400 text-center py-4">${t('history_error')}: ${e.message}</div>`;
     }
 
-    // 切换 session 后立即检查一次 busy 状态
-    try {
-        const sr = await fetch('/proxy_session_status', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ session_id: sessionId })
-        });
-        const sd = await sr.json();
-        if (sd.busy) {
-            setSystemBusyUI(true);
-        } else {
-            setSystemBusyUI(false);
-        }
-    } catch(e) {} finally {
-        if (_ocChatMode === 'internal') {
-            ocInternalSyncNameInput();
-            ocInternalRepaintSessionPick();
-            scrollChatToBottom(chatBox, { force: true });
-        }
-        if (!quiet) hidePageLoading();
+    if (_ocChatMode === 'internal') {
+        ocInternalSyncNameInput();
+        ocInternalRepaintSessionPick();
+        scrollChatToBottom(chatBox, { force: true });
     }
+    if (!quiet) hidePageLoading();
 }
 
 function ocSyncSessionSubrowsVisibility() {
@@ -7493,6 +7614,25 @@ async function handleSend() {
     let agentDiv = null;
     let fullText = '';
 
+    // --- 会话/平台隔离：捕获本次流所属的上下文。一旦用户切到别的 session 或平台，
+    //     就停止向 DOM 写入（仍继续把流读完，保持后端连接/存储不受影响），避免串味。 ---
+    const _computeStreamCtxKey = () => JSON.stringify({
+        mode: _ocChatMode,
+        sid: currentSessionId,
+        agent: _ocSelectedAgent ? _ocSelectedAgent.name : null,
+        acp: _acpTool || null,
+    });
+    const _streamOwnerKey = _computeStreamCtxKey();
+    let _streamAbandoned = false;
+    const streamOwns = () => {
+        if (_streamAbandoned) return false;
+        if (_computeStreamCtxKey() !== _streamOwnerKey) {
+            _streamAbandoned = true;
+            return false;
+        }
+        return true;
+    };
+
     try {
         // --- 构造 workflow / persona 前缀（隐藏在消息中发送给后端） ---
         let personaPrefix = '';
@@ -7786,6 +7926,9 @@ async function handleSend() {
                     const delta = chunk.choices && chunk.choices[0] && chunk.choices[0].delta;
                     if (!delta) continue;
 
+                    // 已切换 session/平台：丢弃本帧渲染（继续把流读完，不写入当前显示的对话）
+                    if (!streamOwns()) continue;
+
                     // --- 处理结构化 meta 事件 ---
                     if (delta.meta) {
                         const m = delta.meta;
@@ -7837,6 +7980,15 @@ async function handleSend() {
             }
         }
 
+        // 流已被切走（用户跳到别的 session/平台）：不再触碰当前显示的对话。
+        // 若此刻用户又切回了原会话，则静默从后端历史刷新，让完整回复补显出来。
+        if (!streamOwns()) {
+            if (_computeStreamCtxKey() === _streamOwnerKey && _ocChatMode === 'internal' && currentSessionId) {
+                switchToSession(currentSessionId, true, { quiet: true }).catch(() => {});
+            }
+            return;
+        }
+
         // 流式结束：封存最后一个气泡
         if (fullText) {
             agentDiv.innerHTML = renderMarkdown(fullText);
@@ -7866,6 +8018,10 @@ async function handleSend() {
     } catch (error) {
         const typingIndicator = document.getElementById('typing-indicator');
         if (typingIndicator) typingIndicator.remove();
+        // 流已被切走：不要把错误/中止提示塞进当前显示的对话
+        if (!streamOwns()) {
+            return;
+        }
         if (error.name === 'AbortError') {
             if (agentDiv) {
                 fullText += '\n\n' + t('thinking_stopped');
@@ -7888,9 +8044,13 @@ async function handleSend() {
             appendMessage(t('agent_error') + ': ' + errText, false);
         }
     } finally {
-        currentAbortController = null;
-        setStreamingUI(false);
-        hideNewMsgBanner();
+        // 仅当本次流仍拥有当前显示的会话/平台时，才复位全局 streaming 状态；
+        // 否则可能误清掉切换后新会话正在进行的流的 abort controller / UI。
+        if (streamOwns()) {
+            currentAbortController = null;
+            setStreamingUI(false);
+            hideNewMsgBanner();
+        }
     }
 }
 
@@ -10869,6 +11029,7 @@ setInterval(() => {
 
 // === System trigger polling: 检测后台系统触发产生的新消息 ===
 let _sessionStatusTimer = null;
+let _sessionStatusPolling = false;
 
 function startSessionStatusPolling() {
     stopSessionStatusPolling();
@@ -10876,6 +11037,8 @@ function startSessionStatusPolling() {
         if (!currentUserId || !currentSessionId) return;
         // 用户正在流式对话中，跳过轮询
         if (cancelBtn.style.display !== 'none') return;
+        if (_sessionStatusPolling) return;
+        _sessionStatusPolling = true;
         try {
             const resp = await fetch('/proxy_session_status', {
                 method: 'POST',
@@ -10885,15 +11048,24 @@ function startSessionStatusPolling() {
             const data = await resp.json();
 
             // --- 系统占用状态 ---
-            if (data.busy) {
-                setSystemBusyUI(true);
-            } else if (busyBtn.style.display !== 'none') {
+            setSystemBusyUI(!!data.busy);
+            if (!data.busy && busyBtn.style.display !== 'none') {
                 // busy → 不busy：恢复按钮，显示刷新横幅
-                setSystemBusyUI(false);
                 showNewMsgBanner();
+            }
+            // --- 上下文用量徽章 ---
+            if (typeof data.context_percent !== 'undefined') {
+                updateSessionContextUsageBadge(
+                    data.context_percent,
+                    data.context_remaining,
+                    data.context_tokens,
+                    data.context_budget
+                );
             }
         } catch(e) {
             // 静默忽略
+        } finally {
+            _sessionStatusPolling = false;
         }
     }, 5000); // 每 5 秒轮询一次
 }
@@ -11051,6 +11223,10 @@ document.addEventListener('click', function(e) {
     const inputArea = document.querySelector('.group-input-area');
     if (popup && inputArea && !inputArea.contains(e.target)) {
         popup.classList.remove('show');
+    }
+    const contextUsageWrap = document.querySelector('.oc-context-usage-wrap');
+    if (contextUsageWrap && !contextUsageWrap.contains(e.target)) {
+        closeSessionContextDetail();
     }
 });
 
@@ -13665,12 +13841,12 @@ async def main(ctx: Context):
     #
     # By default, the runtime auto-creates one OASIS topic before main(ctx) starts.
     #   ctx.topic_id is usually already available
-    #   await ctx.publish(...) writes both local logs and topic posts
+    #   await ctx.publish(...) is async and writes both local logs and topic posts
     #
     # Available through ctx:
     #   ctx.question, ctx.user_id, ctx.team, ctx.topic_id, ctx.run_id
     #   ctx.list_agents(), ctx.get_agent(), ctx.send_agent(...)
-    #   ctx.publish(...), ctx.set_result(...), ctx.set_conclusion(...)
+    #   await ctx.publish(...), ctx.set_result(...), ctx.set_conclusion(...)
     #   ctx.create_empty_topic(...), ctx.publish_to_topic(...), ctx.conclude_topic(...)
     # Notes:
     #   ctx.list_agents() is synchronous: do not write await ctx.list_agents()

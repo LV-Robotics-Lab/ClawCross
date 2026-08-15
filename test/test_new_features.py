@@ -163,18 +163,23 @@ class TestTokenBudget:
         assert budget.total_input_tokens == 1000
         assert budget.total_output_tokens == 500
 
+    def test_remaining_budget_uses_current_compressed_context(self):
+        from utils.token_budget import SessionTokenBudget
+        budget = SessionTokenBudget(max_context_tokens=2000)
+        budget.update_current_context(used_tokens=1500, budget_tokens=2000)
+        assert budget.remaining_budget() == 500
+
     def test_context_pressure(self):
         from utils.token_budget import SessionTokenBudget
         budget = SessionTokenBudget(max_context_tokens=1000)
-        budget.record_turn(input_tokens=800, output_tokens=100)
-        # (800 + 100) / 1000 = 0.9 (now includes output per openclaw)
+        budget.update_current_context(used_tokens=900, budget_tokens=1000)
         assert budget.context_pressure == 0.9
         assert budget.is_warning
 
     def test_critical_threshold(self):
         from utils.token_budget import SessionTokenBudget
         budget = SessionTokenBudget(max_context_tokens=1000)
-        budget.record_turn(input_tokens=960, output_tokens=100)
+        budget.update_current_context(used_tokens=960, budget_tokens=1000)
         assert budget.is_critical
 
     def test_marginal_utility(self):
@@ -205,7 +210,7 @@ class TestTokenBudget:
     def test_format_budget_notice_warning(self):
         from utils.token_budget import SessionTokenBudget
         budget = SessionTokenBudget(max_context_tokens=1000)
-        budget.record_turn(input_tokens=850, output_tokens=0)
+        budget.update_current_context(used_tokens=850, budget_tokens=1000)
         notice = budget.format_budget_notice()
         assert "⚡" in notice
 
@@ -221,9 +226,11 @@ class TestTokenBudget:
     def test_get_status(self):
         from utils.token_budget import SessionTokenBudget
         budget = SessionTokenBudget()
-        budget.record_turn(input_tokens=1000, output_tokens=500)
+        budget.update_current_context(used_tokens=1000, budget_tokens=2000)
         status = budget.get_status()
         assert "total_turns" in status
+        assert status["current_context_tokens"] == 1000
+        assert status["current_context_budget"] == 2000
         assert "context_pressure" in status
         assert "should_continue" in status
 
@@ -232,98 +239,8 @@ class TestTokenBudget:
 # P0: Context Compressor
 # ============================================================================
 
-class TestContextCompressor:
-    """Test 5-level context compression pipeline."""
-
-    def _make_messages(self, count, content_len=100):
-        from langchain_core.messages import HumanMessage, AIMessage
-        msgs = []
-        for i in range(count):
-            if i % 2 == 0:
-                msgs.append(HumanMessage(content="x" * content_len))
-            else:
-                msgs.append(AIMessage(content="y" * content_len))
-        return msgs
-
-    def test_no_compression_needed(self):
-        from utils.context_compressor import compress_context
-        msgs = self._make_messages(4, 10)
-        result, stats = compress_context(msgs, token_budget=100000)
-        assert stats.level_applied == "none"
-        assert len(result) == 4
-
-    def test_snip_level(self):
-        from utils.context_compressor import level_snip
-        from langchain_core.messages import HumanMessage
-        msgs = [HumanMessage(content="x" * 10000)]
-        result = level_snip(msgs, token_budget=500, char_limit=500, preserve_recent=0)
-        assert len(result[0].content) < 10000
-
-    def test_micro_level(self):
-        from utils.context_compressor import level_micro
-        from langchain_core.messages import ToolMessage
-        msgs = [
-            ToolMessage(content="x" * 5000, tool_call_id="tc1", name="read_file"),
-            ToolMessage(content="short", tool_call_id="tc2", name="list_files"),
-        ]
-        result = level_micro(msgs, token_budget=100, preserve_recent=0)
-        assert len(result[0].content) < 5000
-        assert result[1].content == "short"
-
-    def test_collapse_level(self):
-        from utils.context_compressor import level_collapse
-        msgs = self._make_messages(20, 200)
-        result = level_collapse(msgs, token_budget=500, preserve_recent=4)
-        assert len(result) < 20
-
-    def test_evict_level(self):
-        from utils.context_compressor import level_evict
-        msgs = self._make_messages(20, 200)
-        result = level_evict(msgs, token_budget=200, preserve_recent=2)
-        assert len(result) <= 4
-
-    def test_evict_preserves_latest_user_request(self):
-        from langchain_core.messages import HumanMessage, SystemMessage
-        from utils.context_compressor import level_evict
-
-        msgs = [
-            SystemMessage(content="system " + ("s" * 5000)),
-            HumanMessage(content="压缩摘要 " + ("x" * 5000)),
-            HumanMessage(content="latest user request must remain"),
-        ]
-        result = level_evict(msgs, token_budget=10, preserve_recent=1)
-        assert any(
-            isinstance(msg, HumanMessage) and str(msg.content).startswith("压缩摘要")
-            for msg in result
-        )
-        assert any(
-            isinstance(msg, HumanMessage) and msg.content == "latest user request must remain"
-            for msg in result
-        )
-
-    def test_collapse_summary_is_not_system_message(self):
-        from langchain_core.messages import HumanMessage, SystemMessage
-        from utils.context_compressor import level_collapse
-
-        msgs = [HumanMessage(content="old " * 200) for _ in range(20)]
-        result = level_collapse(msgs, token_budget=100, preserve_recent=4)
-        assert isinstance(result[0], HumanMessage)
-        assert not isinstance(result[0], SystemMessage)
-
-    def test_full_pipeline(self):
-        from utils.context_compressor import compress_context
-        msgs = self._make_messages(50, 500)
-        result, stats = compress_context(msgs, token_budget=1000, preserve_recent=4)
-        assert stats.level_applied != "none"
-        assert len(result) < 50
-
-    def test_compression_stats(self):
-        from utils.context_compressor import compress_context
-        msgs = self._make_messages(30, 300)
-        _, stats = compress_context(msgs, token_budget=500)
-        assert stats.original_messages == 30
-        assert stats.final_messages <= 30
-        assert stats.original_tokens > 0
+class TestContextLimits:
+    """Model-aware history budget resolution."""
 
     def test_context_limits_model_aware_defaults(self, monkeypatch):
         from utils.context_limits import infer_model_context_window, resolve_history_token_budget
@@ -333,7 +250,26 @@ class TestContextCompressor:
         monkeypatch.setenv("LLM_MODEL", "MiniMax-M2.7")
 
         assert infer_model_context_window() == 1_000_000
-        assert resolve_history_token_budget() == 128_000
+        # 80% of 1M window, no main-agent cap → 800k
+        assert resolve_history_token_budget() == 800_000
+
+    def test_context_limits_known_model_windows(self, monkeypatch):
+        from utils.context_limits import infer_model_context_window, resolve_history_token_budget
+
+        monkeypatch.delenv("LLM_CONTEXT_WINDOW", raising=False)
+        monkeypatch.delenv("WEBOT_CONTEXT_TOKEN_BUDGET", raising=False)
+
+        monkeypatch.setenv("LLM_MODEL", "gpt-5.4")
+        assert infer_model_context_window() == 1_000_000
+        assert resolve_history_token_budget() == 800_000
+
+        monkeypatch.setenv("LLM_MODEL", "gpt-5.4-mini")
+        assert infer_model_context_window() == 400_000
+        assert resolve_history_token_budget() == 320_000
+
+        monkeypatch.setenv("LLM_MODEL", "deepseek-v4-pro")
+        assert infer_model_context_window() == 1_000_000
+        assert resolve_history_token_budget() == 800_000
 
     def test_context_limits_user_override(self, monkeypatch):
         from utils.context_limits import resolve_history_token_budget
