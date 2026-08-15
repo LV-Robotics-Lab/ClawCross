@@ -26,15 +26,14 @@ from webot.policy import (
     get_tool_policy,
     run_tool_policy_hooks,
 )
-from webot.context import (
-    apply_persistent_compaction,
-    budget_user_messages,
-    budget_tool_messages,
-    compact_history_messages,
-    render_runtime_context_block,
+from webot.compression import (
+    apply_compression,
+    make_llm_summarizer,
+    trim_new_input_if_oversized,
 )
+from webot.context import render_runtime_context_block
 from webot.memory import ensure_memory_state
-from webot.skills import build_skills_prompt
+from webot.skills import build_skills_prompt, build_user_profile_block
 from webot.soul import build_soul_prompt
 from webot.workflow_prompt import build_team_workflow_prompt
 from webot.trajectory import auto_trajectory_enabled, save_trajectory
@@ -46,7 +45,7 @@ from webot.permission_context import (
     create_or_reuse_permission_request,
     resolve_permission_context,
 )
-from webot.profiles import get_agent_profile, parse_subagent_session_id, render_profile_system_prompt
+from webot.profiles import frame_session_identity, get_agent_profile, parse_subagent_session_id, render_profile_system_prompt
 from webot.runtime import (
     PLAN_MODE_BLOCKED_TOOLS,
     REVIEW_MODE_BLOCKED_TOOLS,
@@ -81,7 +80,7 @@ from core.streaming_tool_executor import (
     classify_tool_access, ToolAccessMode, ToolExecutionResult,
 )
 from utils.token_budget import get_session_budget
-from utils.context_compressor import compress_context
+from utils.context_compressor import estimate_messages_tokens
 from utils.context_limits import resolve_history_message_limits, resolve_history_token_budget
 from utils.cache_boundary import SystemPromptCacheManager
 from utils.logging_utils import get_logger
@@ -135,7 +134,7 @@ USER_INJECTED_TOOLS = {
     "list_oasis_topics",
     "list_oasis_sessions",
     "list_oasis_experts", "add_oasis_expert", "update_oasis_expert", "delete_oasis_expert",
-    "set_oasis_workflow", "list_oasis_workflows", "list_oasis_python_workflows",
+    "set_oasis_yaml_workflow", "list_oasis_workflows", "list_oasis_python_workflows",
     "check_oasis_python_run", "yaml_to_layout",
     # Session management tools
     "list_sessions", "get_current_session",
@@ -813,62 +812,15 @@ class TeamAgent:
                         )
         return None
 
-    def _get_user_profile(self, user_id: str) -> str:
-        """从 data/user_files/{user_id}/user_profile.txt 读取用户画像。"""
-        user_files_dir = self._prompts.get("_user_files_dir", "")
-        fpath = os.path.join(user_files_dir, user_id, "user_profile.txt")
-        try:
-            with open(fpath, "r", encoding="utf-8") as f:
-                return f.read().strip()
-        except FileNotFoundError:
-            return ""
-
     def _get_user_skills(self, user_id: str, team: str = "") -> str:
         """
         从 webot.skills 读取用户的 managed skills，
         并返回格式化的 skill 信息字符串。
         即使没有 skill，也会返回位置信息。
         """
-        from webot.skills import list_skills
+        from webot.skills import build_user_skills_listing
 
-        user_files_dir = self._prompts.get("_user_files_dir", "")
-        skills_dir = os.path.join(user_files_dir, user_id, "skills")
-        team_skills = list_skills(user_id, team=team) if team else []
-        personal_skills = list_skills(user_id)
-
-        # 格式化 skill 信息（即使为空也返回位置信息）
-        skill_lines = ["\n【用户技能列表】"]
-        skill_lines.append(f"技能文件目录位置: {skills_dir}")
-        if team:
-            skill_lines.append(f"团队技能目录位置: {os.path.join(user_files_dir, user_id, 'teams', team, 'skills')}")
-
-        def _append_section(title: str, items: list[dict]) -> None:
-            if not items:
-                return
-            skill_lines.append(title)
-            for skill in items:
-                if not isinstance(skill, dict):
-                    continue
-                skill_name = skill.get("name", "未命名技能")
-                skill_desc = skill.get("description", "无描述")
-                skill_file = skill.get("path", "")
-                skill_lines.append(f"  - {skill_name}: {skill_desc}")
-                if skill_file:
-                    skill_lines.append(f"    文件: {skill_file}")
-
-        if team:
-            _append_section("团队技能：", team_skills)
-            _append_section("共享技能：", personal_skills)
-        elif personal_skills:
-            _append_section("可用技能：", personal_skills)
-
-        if team_skills or personal_skills:
-            skill_lines.append("如需使用某个技能，请优先使用 skill_view 查看完整内容。")
-        else:
-            skill_lines.append("当前暂无已注册的技能。")
-            skill_lines.append("如需添加技能，请使用 skill_manage(action='create') 创建。")
-
-        return "\n".join(skill_lines)
+        return build_user_skills_listing(user_id, team=team)
 
     def _find_internal_session_meta(self, user_id: str, session_id: str) -> dict | None:
         """Resolve an internal agent session to its stored meta and owning team.
@@ -1028,22 +980,7 @@ class TeamAgent:
             return ""
 
         display_name = (meta.get("name") or expert_cfg.get("name") or tag or session_id).strip()
-        is_rich_persona = "## " in persona or "# " in persona
-        if is_rich_persona:
-            return (
-                "【当前会话身份设定】\n"
-                f"你当前会话的唯一身份/角色是「{display_name}」，tag 为 \"{tag}\"。\n"
-                "从现在开始，你必须始终以该身份思考、说话和行动。\n"
-                "除非用户明确要求你切换角色，否则不得退回通用助手口吻，不得否认自己的身份，不得自称只是普通 AI 助手。\n"
-                "当用户询问“你是谁”“你的身份是什么”“你在扮演谁”这类问题时，必须优先依据本身份设定回答。\n\n"
-                f"以下是你必须遵守的完整身份与行为指南：\n\n{persona}\n"
-            )
-        return (
-            "【当前会话身份设定】\n"
-            f"你当前会话的唯一身份/角色是「{display_name}」，tag 为 \"{tag}\"。"
-            "从现在开始，你必须始终按这个身份回应；除非用户明确要求切换，否则不得退回默认通用助手身份。"
-            f"{persona}\n"
-        )
+        return frame_session_identity(display_name, tag, persona)
 
     def _build_chat_rules(self, state: AgentState) -> str:
         """根据消息上下文动态组装聊天行为规则。
@@ -1470,9 +1407,7 @@ class TeamAgent:
 
         if (not is_subagent) or (subagent_profile and subagent_profile.include_user_profile):
             # 注入用户专属画像
-            user_profile = self._get_user_profile(user_id)
-            if user_profile:
-                base_prompt += f"\n{user_profile}\n"
+            base_prompt += build_user_profile_block(user_id)
 
         if (not is_subagent) or (subagent_profile and subagent_profile.include_user_skills):
             # 注入用户技能列表（总是显示位置信息）
@@ -1605,35 +1540,29 @@ class TeamAgent:
         if len(history_messages) > 1:
             history_messages = self._strip_multimodal_parts(history_messages[:-1]) + [history_messages[-1]]
 
-        history_token_budget = resolve_history_token_budget(is_subagent=is_subagent)
-        max_history_messages, preserve_recent_messages = resolve_history_message_limits(
+        # 用本轮实际生效的模型名（可能被 cheap_route / model_swap / llm_override 改过）
+        # 反推 budget，而不是回退到 LLM_MODEL env。
+        current_model_name = (
+            getattr(llm, "model_name", "") or getattr(llm, "model", "") or ""
+        ) or None
+        history_token_budget = resolve_history_token_budget(
+            is_subagent=is_subagent,
+            model=current_model_name,
+        )
+        _, preserve_recent_messages = resolve_history_message_limits(
             is_subagent=is_subagent,
             token_budget=history_token_budget,
         )
-        history_messages, compaction_state = apply_persistent_compaction(
-            user_id=user_id,
-            session_id=session_id,
-            messages=history_messages,
-            context_token_budget=history_token_budget,
-            preserve_recent=preserve_recent_messages,
-            max_messages=max_history_messages,
-            checkpoint_store_path=self._db_path,
+        # 记下本轮模型，供静态路径（session_history / session_status）后续使用
+        self._thread_state_registry.set_thread_model(
+            f"{user_id}#{session_id}", current_model_name or ""
         )
-        if compaction_state.get("updated"):
-            print(
-                f">>> [compact-state] updated until={compaction_state.get('compacted_until')} "
-                f"tail_tokens≈{compaction_state.get('tokens')}"
-            )
 
-        history_messages = budget_user_messages(
+        # 1) 当轮新输入瘦身：仅当最后一条 HumanMessage 超大时落盘 + excerpt
+        history_messages = trim_new_input_if_oversized(
+            history_messages,
             user_id=user_id,
             session_id=session_id,
-            messages=history_messages,
-        )
-        history_messages = budget_tool_messages(
-            user_id=user_id,
-            session_id=session_id,
-            messages=history_messages,
         )
 
         with contextlib.suppress(Exception):
@@ -1651,28 +1580,36 @@ class TeamAgent:
                     "context_token_budget": history_token_budget,
                 },
             )
-        history_messages = compact_history_messages(
-            history_messages,
-            max_messages=max_history_messages,
-            preserve_recent=preserve_recent_messages,
-            context_token_budget=history_token_budget,
+
+        # 2) 唯一的历史压缩入口：低频触发，触发即一次性 LLM summary + 段落落盘
+        compression_result = apply_compression(
             user_id=user_id,
             session_id=session_id,
-        )
-
-        # --- 5-level compression pipeline (new) ---
-        token_budget_val = history_token_budget
-        history_messages, compression_stats = compress_context(
-            history_messages,
-            token_budget=token_budget_val,
+            messages=history_messages,
+            history_token_budget=history_token_budget,
+            checkpoint_store_path=self._db_path,
             preserve_recent=preserve_recent_messages,
+            summarizer=make_llm_summarizer(),
         )
-        if compression_stats.level_applied != "none":
-            print(f">>> [compress] applied level={compression_stats.level_applied} "
-                  f"{compression_stats.original_messages}→{compression_stats.final_messages} msgs")
+        history_messages = compression_result.view
+        if compression_result.triggered:
+            print(
+                f">>> [compress] folded until={compression_result.compacted_until} "
+                f"view_tokens≈{compression_result.view_tokens} "
+                f"summary_chars={len(compression_result.summary)}"
+            )
 
-        # --- Token budget tracking (new) ---
+        # --- Token budget tracking ---
         session_budget = get_session_budget(user_id, session_id)
+        session_budget.update_current_context(
+            used_tokens=compression_result.view_tokens,
+            budget_tokens=history_token_budget,
+        )
+        self.set_thread_context_usage(
+            f"{user_id}#{session_id}",
+            compression_result.view_tokens,
+            history_token_budget,
+        )
         budget_notice = session_budget.format_budget_notice()
         if budget_notice:
             base_prompt += f"\n{budget_notice}\n"
@@ -1789,20 +1726,25 @@ class TeamAgent:
             # --- Record token usage for budget tracking (new) ---
             usage_meta = getattr(response, "usage_metadata", None) or {}
             if isinstance(usage_meta, dict) and usage_meta:
-                session_budget.record_turn(
-                    input_tokens=usage_meta.get("input_tokens", 0),
-                    output_tokens=usage_meta.get("output_tokens", 0),
-                    cache_creation_tokens=usage_meta.get("cache_creation_input_tokens", 0),
-                    cache_read_tokens=usage_meta.get("cache_read_input_tokens", 0),
-                )
-                model_name = getattr(llm, "model_name", "") or getattr(llm, "model", "") or ""
-                cost_tracker.record(
-                    model=model_name,
-                    input_tokens=usage_meta.get("input_tokens", 0),
-                    output_tokens=usage_meta.get("output_tokens", 0),
-                    cache_read_tokens=usage_meta.get("cache_read_input_tokens", 0),
-                    cache_write_tokens=usage_meta.get("cache_creation_input_tokens", 0),
-                )
+                input_tokens = int(usage_meta.get("input_tokens", 0) or 0)
+                output_tokens = int(usage_meta.get("output_tokens", 0) or 0)
+                cache_creation_tokens = int(usage_meta.get("cache_creation_input_tokens", 0) or 0)
+                cache_read_tokens = int(usage_meta.get("cache_read_input_tokens", 0) or 0)
+                if input_tokens or output_tokens or cache_creation_tokens or cache_read_tokens:
+                    session_budget.record_turn(
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                        cache_creation_tokens=cache_creation_tokens,
+                        cache_read_tokens=cache_read_tokens,
+                    )
+                    model_name = getattr(llm, "model_name", "") or getattr(llm, "model", "") or ""
+                    cost_tracker.record(
+                        model=model_name,
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                        cache_read_tokens=cache_read_tokens,
+                        cache_write_tokens=cache_creation_tokens,
+                    )
 
             invalid_feedback = self._find_invalid_tool_feedback(response)
             if invalid_feedback is None:
@@ -2231,6 +2173,18 @@ class TeamAgent:
     def get_thread_busy_source(self, thread_id: str) -> str:
         """返回锁来源: "user"、"system"、或 "" (未占用)。"""
         return self._thread_state_registry.get_thread_busy_source(thread_id)
+
+    def set_thread_context_usage(self, thread_id: str, tokens: int, budget: int):
+        """设置该 thread 的当前压缩上下文用量。"""
+        self._thread_state_registry.set_thread_context_usage(thread_id, tokens, budget)
+
+    def get_thread_context_usage(self, thread_id: str) -> dict[str, int]:
+        """返回该 thread 的当前压缩上下文用量。"""
+        return self._thread_state_registry.get_thread_context_usage(thread_id)
+
+    def get_thread_model(self, thread_id: str) -> str:
+        """返回该 thread 上一次推理实际使用的模型名（用于静态路径反推 budget）。"""
+        return self._thread_state_registry.get_thread_model(thread_id)
 
     def get_all_thread_status(self, prefix: str) -> dict[str, dict]:
         """返回指定前缀下所有已知 thread 的状态。"""
